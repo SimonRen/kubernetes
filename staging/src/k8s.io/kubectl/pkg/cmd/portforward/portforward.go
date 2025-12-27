@@ -31,6 +31,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -59,6 +61,13 @@ type PortForwardOptions struct {
 	PortForwarder portForwarder
 	StopChannel   chan struct{}
 	ReadyChannel  chan struct{}
+
+	// RetryConfig holds configuration for resilient port-forwarding with auto-reconnect
+	RetryConfig RetryConfig
+	// OriginalObject stores the original resource (Service, Deployment, etc.) for pod re-selection
+	OriginalObject runtime.Object
+	// PodSelector is the label selector for finding replacement pods (used with services/deployments)
+	PodSelector labels.Selector
 }
 
 var (
@@ -116,6 +125,14 @@ func NewCmdPortForward(f cmdutil.Factory, streams genericiooptions.IOStreams) *c
 	}
 	cmdutil.AddPodRunningTimeoutFlag(cmd, defaultPodPortForwardWaitTimeout)
 	cmd.Flags().StringSliceVar(&opts.Address, "address", []string{"localhost"}, "Addresses to listen on (comma separated). Only accepts IP addresses or localhost as a value. When localhost is supplied, kubectl will try to bind on both 127.0.0.1 and ::1 and will fail if neither of these addresses are available to bind.")
+
+	// Resilient port-forward flags
+	cmd.Flags().BoolVar(&opts.RetryConfig.Enabled, "retry", false, "Enable automatic reconnection when the connection is lost")
+	cmd.Flags().DurationVar(&opts.RetryConfig.InitialDelay, "retry-delay", 5*time.Second, "Initial delay before retrying a failed connection")
+	cmd.Flags().DurationVar(&opts.RetryConfig.MaxDelay, "max-retry-delay", 60*time.Second, "Maximum delay between retry attempts (exponential backoff cap)")
+	cmd.Flags().DurationVar(&opts.RetryConfig.HealthCheckPeriod, "health-check-interval", 10*time.Second, "Interval for connection health checks")
+	cmd.Flags().IntVar(&opts.RetryConfig.MaxRetries, "max-retries", 0, "Maximum number of retry attempts (0 = infinite)")
+
 	// TODO support UID
 	return cmd
 }
@@ -125,6 +142,7 @@ func NewDefaultPortForwardOptions(streams genericiooptions.IOStreams) *PortForwa
 		PortForwarder: &defaultPortForwarder{
 			IOStreams: streams,
 		},
+		RetryConfig: DefaultRetryConfig(),
 	}
 }
 
@@ -351,6 +369,12 @@ func (o *PortForwardOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, arg
 
 	o.PodName = forwardablePod.Name
 
+	// Store original object and selector for resilient port-forward pod re-selection
+	o.OriginalObject = obj
+	if _, selector, err := polymorphichelpers.SelectorsForObject(obj); err == nil {
+		o.PodSelector = selector
+	}
+
 	// handle service port mapping to target port if needed
 	switch t := obj.(type) {
 	case *corev1.Service:
@@ -411,14 +435,23 @@ func (o PortForwardOptions) Validate() error {
 }
 
 // Deprecated: Use RunPortForwardContext instead, which allows canceling.
-func (o PortForwardOptions) RunPortForward() error {
+func (o *PortForwardOptions) RunPortForward() error {
 	return o.RunPortForwardContext(context.Background())
 }
 
 // RunPortForwardContext implements all the necessary functionality for port-forward cmd.
 // It ends portforwarding when an error is received from the backend, or an os.Interrupt
 // signal is received, or the provided context is done.
-func (o PortForwardOptions) RunPortForwardContext(ctx context.Context) error {
+// When --retry is enabled, it delegates to runResilientPortForward for automatic reconnection.
+func (o *PortForwardOptions) RunPortForwardContext(ctx context.Context) error {
+	if o.RetryConfig.Enabled {
+		return o.runResilientPortForward(ctx)
+	}
+	return o.runSinglePortForward(ctx)
+}
+
+// runSinglePortForward runs a single port-forward session (original behavior).
+func (o *PortForwardOptions) runSinglePortForward(ctx context.Context) error {
 	pod, err := o.PodClient.Pods(o.Namespace).Get(ctx, o.PodName, metav1.GetOptions{})
 	if err != nil {
 		return err
@@ -451,5 +484,5 @@ func (o PortForwardOptions) RunPortForwardContext(ctx context.Context) error {
 		Name(pod.Name).
 		SubResource("portforward")
 
-	return o.PortForwarder.ForwardPorts("POST", req.URL(), o)
+	return o.PortForwarder.ForwardPorts("POST", req.URL(), *o)
 }
