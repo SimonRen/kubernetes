@@ -19,6 +19,7 @@ package portforward
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -76,6 +77,21 @@ type PortForwardOptions struct {
 	// retry loop re-resolves named ports against the currently selected pod
 	// from these raw values on every reconnect.
 	RawPorts []string
+
+	// ErrOut sinks the messages the resilient retry loop emits ("Connection
+	// lost", "Switching to pod", reconnect notes, the no-pod-selector warning
+	// in Complete()). When nil, falls back to os.Stderr — preserving CLI
+	// behavior. Library callers (e.g. cmd/multi-fwd) set it to a logger so
+	// these operationally-important messages can be tagged per session.
+	ErrOut io.Writer
+}
+
+// errOut returns ErrOut, defaulting to os.Stderr.
+func (o *PortForwardOptions) errOut() io.Writer {
+	if o.ErrOut != nil {
+		return o.ErrOut
+	}
+	return os.Stderr
 }
 
 var (
@@ -150,6 +166,7 @@ func NewDefaultPortForwardOptions(streams genericiooptions.IOStreams) *PortForwa
 			IOStreams: streams,
 		},
 		RetryConfig: DefaultRetryConfig(),
+		ErrOut:      streams.ErrOut,
 	}
 }
 
@@ -427,7 +444,7 @@ func (o *PortForwardOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, arg
 		if _, selector, selErr := polymorphichelpers.SelectorsForObject(obj); selErr == nil {
 			o.PodSelector = selector
 		} else {
-			fmt.Fprintf(os.Stderr, "Note: %s/%s has no pod selector; --retry will reconnect to the same pod and will not pick a replacement on rollout.\n", obj.GetObjectKind().GroupVersionKind().Kind, resourceName)
+			fmt.Fprintf(o.errOut(), "Note: %s/%s has no pod selector; --retry will reconnect to the same pod and will not pick a replacement on rollout.\n", obj.GetObjectKind().GroupVersionKind().Kind, resourceName)
 		}
 	}
 

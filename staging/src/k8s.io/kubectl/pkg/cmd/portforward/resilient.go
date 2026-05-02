@@ -257,7 +257,7 @@ func (o *PortForwardOptions) runResilientPortForward(ctx context.Context) error 
 		}
 
 		delay := backoff.Step()
-		fmt.Fprintf(os.Stderr, "Connection lost: %v. Reconnecting in %v (attempt %d)...\n",
+		fmt.Fprintf(o.errOut(), "Connection lost: %v. Reconnecting in %v (attempt %d)...\n",
 			err, delay.Round(time.Second), retryCount)
 
 		select {
@@ -272,9 +272,9 @@ func (o *PortForwardOptions) runResilientPortForward(ctx context.Context) error 
 			case reselectErr != nil && errors.Is(reselectErr, context.Canceled):
 				return runCtx.Err()
 			case reselectErr != nil:
-				fmt.Fprintf(os.Stderr, "Warning: failed to re-select pod: %v (will retry with current pod)\n", reselectErr)
+				fmt.Fprintf(o.errOut(), "Warning: failed to re-select pod: %v (will retry with current pod)\n", reselectErr)
 			case newPod != "" && newPod != o.PodName:
-				fmt.Fprintf(os.Stderr, "Switching to pod: %s\n", newPod)
+				fmt.Fprintf(o.errOut(), "Switching to pod: %s\n", newPod)
 				o.PodName = newPod
 			}
 		}
