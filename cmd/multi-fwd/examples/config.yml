@@ -1,0 +1,57 @@
+# multi-fwd example config — drop at ~/.config/multi-fwd/config.yml
+# (or wherever you point `multi-fwd run --config <path>`).
+#
+# Top-level shape:
+#   defaults:  applied to every forward unless that forward overrides
+#   forwards:  list of port-forward sessions to supervise (>=1)
+#
+# Per-forward fields:
+#   name        unique identifier (required, used in logs)
+#   context     kubeconfig context (required — no implicit fallback)
+#   kubeconfig  path to kubeconfig (optional; relative paths resolve
+#               against this file's directory; '~' expands to $HOME)
+#   namespace   override the context's namespace (optional)
+#   resource    TYPE/NAME like svc/postgres, deployment/api, pod/foo (required)
+#   ports       list of [LOCAL:]REMOTE specs (required, >=1)
+#   address     listen addresses (optional; default ["127.0.0.1"])
+#   pod_running_timeout  e.g. "60s" (optional)
+#   retry       per-forward override of defaults.retry (optional)
+
+defaults:
+  retry:
+    enabled: true
+    initial_delay: 5s
+    max_delay: 60s
+    max_retries: 0       # 0 = unlimited (recommended for a daemon)
+  address:
+    - localhost              # matches kubectl's --address default (binds v4+v6 loopback)
+  pod_running_timeout: 60s
+
+forwards:
+  - name: pg-prod
+    context: prod-cluster
+    kubeconfig: ~/.kube/config
+    namespace: data
+    resource: svc/postgres
+    ports:
+      - "5433:5432"
+
+  - name: redis-stage
+    context: stage-cluster
+    namespace: cache
+    resource: deployment/redis
+    ports:
+      - "6380:6379"
+    retry:
+      enabled: true
+      initial_delay: 2s
+      max_delay: 30s
+
+  - name: tmp-debug-pod
+    context: dev-cluster
+    namespace: default
+    resource: pod/debug-shell-0
+    ports:
+      - "9229:9229"
+    retry:
+      enabled: false       # short-lived debug forward, fail fast

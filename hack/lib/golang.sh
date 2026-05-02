@@ -258,6 +258,7 @@ kube::golang::setup_platforms
 readonly KUBE_CLIENT_TARGETS=(
   cmd/kubectl
   cmd/kubectl-convert
+  cmd/multi-fwd
 )
 readonly KUBE_CLIENT_BINARIES=("${KUBE_CLIENT_TARGETS[@]##*/}")
 readonly KUBE_CLIENT_BINARIES_WIN=("${KUBE_CLIENT_BINARIES[@]/%/.exe}")
