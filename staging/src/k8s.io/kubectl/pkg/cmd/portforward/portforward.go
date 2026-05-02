@@ -25,6 +25,8 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -62,12 +64,18 @@ type PortForwardOptions struct {
 	StopChannel   chan struct{}
 	ReadyChannel  chan struct{}
 
-	// RetryConfig holds configuration for resilient port-forwarding with auto-reconnect
+	// RetryConfig holds configuration for resilient port-forwarding with auto-reconnect.
 	RetryConfig RetryConfig
-	// OriginalObject stores the original resource (Service, Deployment, etc.) for pod re-selection
+	// OriginalObject is the resolved resource (Service, Deployment, Pod, ...) used
+	// to re-resolve named ports after a pod switch in the resilient retry loop.
 	OriginalObject runtime.Object
-	// PodSelector is the label selector for finding replacement pods (used with services/deployments)
+	// PodSelector finds replacement pods for service/deployment/etc. targets.
+	// Nil for direct pod targets — disables pod re-selection.
 	PodSelector labels.Selector
+	// RawPorts holds the user-supplied port arguments verbatim. The resilient
+	// retry loop re-resolves named ports against the currently selected pod
+	// from these raw values on every reconnect.
+	RawPorts []string
 }
 
 var (
@@ -126,12 +134,11 @@ func NewCmdPortForward(f cmdutil.Factory, streams genericiooptions.IOStreams) *c
 	cmdutil.AddPodRunningTimeoutFlag(cmd, defaultPodPortForwardWaitTimeout)
 	cmd.Flags().StringSliceVar(&opts.Address, "address", []string{"localhost"}, "Addresses to listen on (comma separated). Only accepts IP addresses or localhost as a value. When localhost is supplied, kubectl will try to bind on both 127.0.0.1 and ::1 and will fail if neither of these addresses are available to bind.")
 
-	// Resilient port-forward flags
-	cmd.Flags().BoolVar(&opts.RetryConfig.Enabled, "retry", false, "Enable automatic reconnection when the connection is lost")
-	cmd.Flags().DurationVar(&opts.RetryConfig.InitialDelay, "retry-delay", 5*time.Second, "Initial delay before retrying a failed connection")
-	cmd.Flags().DurationVar(&opts.RetryConfig.MaxDelay, "max-retry-delay", 60*time.Second, "Maximum delay between retry attempts (exponential backoff cap)")
-	cmd.Flags().DurationVar(&opts.RetryConfig.HealthCheckPeriod, "health-check-interval", 10*time.Second, "Interval for connection health checks")
-	cmd.Flags().IntVar(&opts.RetryConfig.MaxRetries, "max-retries", 0, "Maximum number of retry attempts (0 = infinite)")
+	// Resilient port-forward flags.
+	cmd.Flags().BoolVar(&opts.RetryConfig.Enabled, "retry", false, "Enable automatic reconnection when the connection is lost.")
+	cmd.Flags().DurationVar(&opts.RetryConfig.InitialDelay, "retry-delay", 5*time.Second, "Initial delay before retrying a failed connection (used as exponential-backoff base).")
+	cmd.Flags().DurationVar(&opts.RetryConfig.MaxDelay, "max-retry-delay", 60*time.Second, "Maximum delay between retry attempts (exponential backoff cap).")
+	cmd.Flags().IntVar(&opts.RetryConfig.MaxRetries, "max-retries", 0, "Maximum number of reconnect attempts after a failure (0 = unlimited).")
 
 	// TODO support UID
 	return cmd
@@ -152,6 +159,23 @@ type portForwarder interface {
 
 type defaultPortForwarder struct {
 	genericiooptions.IOStreams
+
+	// boundMu guards bound. The retry loop reads bound to pin local ports
+	// across reconnects; the capture goroutine in ForwardPorts writes it.
+	boundMu sync.Mutex
+	bound   []portforward.ForwardedPort
+}
+
+// GetBoundPorts implements boundPortReporter from resilient.go. It returns the
+// most recently captured set of locally-bound ports (after a successful Ready
+// signal). The slice is copied so callers can hold it without locking.
+func (f *defaultPortForwarder) GetBoundPorts() []portforward.ForwardedPort {
+	f.boundMu.Lock()
+	defer f.boundMu.Unlock()
+	if f.bound == nil {
+		return nil
+	}
+	return append([]portforward.ForwardedPort(nil), f.bound...)
 }
 
 func createDialer(method string, url *url.URL, opts PortForwardOptions) (streamhttp.Dialer, error) {
@@ -182,6 +206,28 @@ func (f *defaultPortForwarder) ForwardPorts(method string, url *url.URL, opts Po
 	if err != nil {
 		return err
 	}
+
+	// Capture bound local ports as soon as fw signals ready, so the resilient
+	// retry loop can pin them across reconnects. The goroutine exits when
+	// either Ready or Stop fires; both are guaranteed to fire before
+	// ForwardPorts returns (Ready on success, Stop via the retry loop's
+	// per-iteration cancel).
+	if opts.ReadyChannel != nil && opts.StopChannel != nil {
+		go func() {
+			select {
+			case <-opts.ReadyChannel:
+				ports, perr := fw.GetPorts()
+				if perr != nil {
+					return
+				}
+				f.boundMu.Lock()
+				f.bound = ports
+				f.boundMu.Unlock()
+			case <-opts.StopChannel:
+			}
+		}()
+	}
+
 	return fw.ForwardPorts()
 }
 
@@ -369,10 +415,20 @@ func (o *PortForwardOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, arg
 
 	o.PodName = forwardablePod.Name
 
-	// Store original object and selector for resilient port-forward pod re-selection
-	o.OriginalObject = obj
-	if _, selector, err := polymorphichelpers.SelectorsForObject(obj); err == nil {
-		o.PodSelector = selector
+	// When --retry is requested, capture the raw user port arguments and the
+	// resolved target object so the retry loop can re-resolve named ports
+	// against the freshly selected pod after a reconnect. Selector lookup is
+	// best-effort: a missing selector silently disables pod re-selection
+	// (single-pod targets only). Surface the error to the user when they
+	// asked for resilient mode.
+	if o.RetryConfig.Enabled {
+		o.RawPorts = append([]string(nil), args[1:]...)
+		o.OriginalObject = obj
+		if _, selector, selErr := polymorphichelpers.SelectorsForObject(obj); selErr == nil {
+			o.PodSelector = selector
+		} else {
+			fmt.Fprintf(os.Stderr, "Note: %s/%s has no pod selector; --retry will reconnect to the same pod and will not pick a replacement on rollout.\n", obj.GetObjectKind().GroupVersionKind().Kind, resourceName)
+		}
 	}
 
 	// handle service port mapping to target port if needed
@@ -431,6 +487,12 @@ func (o PortForwardOptions) Validate() error {
 	if o.PortForwarder == nil || o.PodClient == nil || o.RESTClient == nil || o.Config == nil {
 		return fmt.Errorf("client, client config, restClient, and portforwarder must be provided")
 	}
+
+	if o.RetryConfig.Enabled {
+		if err := validateRetryConfig(o.RetryConfig); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -462,7 +524,7 @@ func (o *PortForwardOptions) runSinglePortForward(ctx context.Context) error {
 	}
 
 	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(signals)
 
 	returnCtx, returnCtxCancel := context.WithCancel(ctx)
